@@ -120,22 +120,36 @@ function startHome() {
 
 function startRoom(roomId) {
   const hostKey = localStorage.getItem(`wt-host:${roomId}`);
+  let clientId = localStorage.getItem("wt-client");
+  if (!clientId) {
+    clientId = crypto.randomUUID().replaceAll("-", "");
+    localStorage.setItem("wt-client", clientId);
+  }
   let ws = null;
   let role = null;
   let retryDelay = 1000;
   let stopped = false;
-  let unlocked = false; // viewer has clicked, so the browser allows playback with sound
-  let latest = null; // latest state received from the host (viewer only)
+  let unlocked = false; // the browser allows playback with sound (the user has clicked)
+  let latest = null; // latest room state received, with receivedAt
+  let version = 0; // newest room state version we know about
+  let appliedPlaying = false; // what the room last told our player to do
+  let programmaticSeek = null; // position of a seek we caused ourselves
+  let myBuffering = false; // we told the room our player is stalled
+  let waitingShown = false;
 
   $("room").hidden = false;
   $("room-code").textContent = roomId;
+  video.controls = true; // both people can play, pause and seek
 
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const query = hostKey ? `?key=${encodeURIComponent(hostKey)}` : "";
+    const query = `?cid=${clientId}${hostKey ? `&key=${encodeURIComponent(hostKey)}` : ""}`;
     ws = new WebSocket(`${proto}://${location.host}/api/rooms/${roomId}/ws${query}`);
 
-    ws.addEventListener("open", () => (retryDelay = 1000));
+    ws.addEventListener("open", () => {
+      retryDelay = 1000;
+      myBuffering = false; // a fresh connection starts with a clean buffering flag
+    });
     ws.addEventListener("message", (e) => handleMessage(JSON.parse(e.data)));
     ws.addEventListener("close", (e) => {
       if (stopped || [4000, 4001, 4004].includes(e.code)) return;
@@ -149,11 +163,15 @@ function startRoom(roomId) {
     switch (msg.type) {
       case "welcome":
         setRole(msg.role);
-        if (role === "host") resumeAsHost(msg.state);
-        else receiveState(msg.state);
+        version = msg.state.version;
+        resume(msg.state);
         break;
       case "state":
+        version = msg.state.version;
         receiveState(msg.state);
+        break;
+      case "ack":
+        version = msg.version;
         break;
       case "presence":
         renderPresence(msg);
@@ -169,13 +187,13 @@ function startRoom(roomId) {
     role = newRole;
     const isHost = role === "host";
     const badge = $("role-badge");
-    badge.textContent = isHost ? "You're the host" : "Viewer";
+    badge.textContent = isHost ? "You're the host" : "Guest";
     badge.classList.toggle("host", isHost);
     $("copy-link").hidden = !isHost;
     $("room-url-form").hidden = !isHost;
-    $("viewer-controls").hidden = isHost;
-    video.controls = isHost;
-    if (!isHost && !unlocked) {
+    if (isHost) {
+      unlocked = true; // if the browser disagrees, play() fails and the overlay appears
+    } else if (!unlocked) {
       $("player-wrap").hidden = false;
       $("overlay").hidden = false;
     }
@@ -188,47 +206,59 @@ function startRoom(roomId) {
         : host ? "🟢 Host is online" : "⚪ Host is offline";
   }
 
-  // ----- host side -----
+  // ----- sending -----
 
   function sendUpdate(reason) {
-    if (role !== "host" || ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({
+    if (!role || ws?.readyState !== WebSocket.OPEN) return;
+    const msg = {
       type: "update",
       reason,
-      url: currentUrl,
       playing: !video.paused && !video.ended,
       time: video.currentTime || 0,
-    }));
+      base: version, // lets the room discard heartbeats that raced with a newer action
+    };
+    if (reason === "load") msg.url = currentUrl;
+    ws.send(JSON.stringify(msg));
   }
 
-  async function resumeAsHost(state) {
-    const pending = sessionStorage.getItem(`wt-pending-url:${roomId}`);
-    sessionStorage.removeItem(`wt-pending-url:${roomId}`);
-
-    if (!state.url && pending) {
-      await loadSource(pending);
-      $("room-url-input").value = pending;
-      sendUpdate("load");
-    } else if (state.url && state.url !== currentUrl) {
-      // Host reloaded the page: pick up where the room left off.
-      $("room-url-input").value = state.url;
-      await loadSource(state.url);
-      await whenReady();
-      video.currentTime = state.time;
-      if (state.playing) {
-        // Autoplay can be blocked without a click; if so, pause for both.
-        video.play().catch(() => sendUpdate("pause"));
-      }
-    } else {
-      sendUpdate("seek"); // reconnected mid-session: resync the viewer
-    }
+  // Tell the room when our player stalls or recovers so both sides can wait for each other.
+  function setBuffering(buffering) {
+    if (myBuffering === buffering || ws?.readyState !== WebSocket.OPEN) return;
+    myBuffering = buffering;
+    ws.send(JSON.stringify({ type: "buffering", buffering, time: video.currentTime || 0 }));
   }
 
-  video.addEventListener("play", () => sendUpdate("play"));
-  video.addEventListener("pause", () => sendUpdate("pause"));
-  video.addEventListener("seeked", () => sendUpdate("seek"));
+  function checkReady() {
+    if (myBuffering && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) setBuffering(false);
+  }
+
+  // Events caused by applyState() match what the room already knows, so only genuine
+  // user actions (which differ from the room's state) get sent.
+  video.addEventListener("play", () => {
+    if (appliedPlaying) return;
+    appliedPlaying = true;
+    sendUpdate("play");
+  });
+  video.addEventListener("pause", () => {
+    if (!appliedPlaying) return;
+    appliedPlaying = false;
+    sendUpdate("pause");
+  });
+  video.addEventListener("seeked", () => {
+    const ours = programmaticSeek !== null && Math.abs(video.currentTime - programmaticSeek) < 0.5;
+    programmaticSeek = null;
+    if (!ours) sendUpdate("seek");
+  });
+  video.addEventListener("waiting", () => {
+    if (!video.paused && appliedPlaying) setBuffering(true);
+  });
+  video.addEventListener("canplay", checkReady);
+  video.addEventListener("playing", checkReady);
+  setInterval(checkReady, 1000);
+
   setInterval(() => {
-    if (!video.paused) sendUpdate("sync");
+    // Drift correction: the host's position is the reference while playing normally.
+    if (role === "host" && !video.paused && appliedPlaying && !myBuffering) sendUpdate("sync");
   }, SYNC_INTERVAL_MS);
 
   $("room-url-form").addEventListener("submit", async (e) => {
@@ -236,6 +266,7 @@ function startRoom(roomId) {
     const url = parseHttpsUrl($("room-url-input").value);
     if (!url) return showMessage("Please enter a valid https:// URL.");
     await loadSource(url);
+    appliedPlaying = false;
     sendUpdate("load");
   });
 
@@ -249,30 +280,69 @@ function startRoom(roomId) {
     }
   });
 
-  // ----- viewer side -----
+  // ----- receiving -----
+
+  async function resume(state) {
+    const pending = sessionStorage.getItem(`wt-pending-url:${roomId}`);
+    sessionStorage.removeItem(`wt-pending-url:${roomId}`);
+
+    if (role === "host" && !state.url && pending) {
+      await loadSource(pending);
+      $("room-url-input").value = pending;
+      sendUpdate("load");
+    } else {
+      receiveState(state);
+    }
+  }
 
   function receiveState(state) {
     latest = { ...state, receivedAt: performance.now() };
     applyState();
   }
 
+  function renderWaiting(s) {
+    if (s.waiting?.length) {
+      const mine = s.waiting.includes(role === "host" ? "host" : "viewer");
+      showMessage(
+        mine
+          ? "Your video is buffering… playback resumes for both of you when it's ready."
+          : "Your friend's video is buffering… playback resumes when they're ready.",
+        "info",
+      );
+      waitingShown = true;
+    } else if (waitingShown) {
+      showMessage("");
+      waitingShown = false;
+    }
+  }
+
   async function applyState() {
     const s = latest;
-    if (!s || role !== "viewer") return;
+    if (!s) return;
 
-    if (s.url !== currentUrl) await loadSource(s.url);
+    if (s.url !== currentUrl) {
+      await loadSource(s.url);
+      if (role === "host") $("room-url-input").value = s.url ?? "";
+      waitingShown = false;
+    }
+    if (latest !== s) return; // a newer state arrived while we were loading
     if (!s.url) {
       showMessage("Waiting for the host to pick a video…", "info");
       return;
     }
+    renderWaiting(s);
     if (!unlocked) return; // overlay is showing; we'll apply once they click
     await whenReady();
-    if (latest !== s) return; // a newer state arrived while we were loading
+    if (latest !== s) return;
 
     const target = s.time + (s.playing ? (performance.now() - s.receivedAt) / 1000 : 0);
     const tolerance = s.reason === "sync" ? 1.0 : 0.3;
-    if (Math.abs(video.currentTime - target) > tolerance) video.currentTime = target;
+    if (Math.abs(video.currentTime - target) > tolerance) {
+      programmaticSeek = target;
+      video.currentTime = target;
+    }
 
+    appliedPlaying = s.playing;
     if (s.playing && video.paused) {
       try {
         await video.play();
@@ -291,17 +361,6 @@ function startRoom(roomId) {
     unlocked = true;
     $("overlay").hidden = true;
     applyState();
-  });
-
-  $("volume").addEventListener("input", (e) => {
-    video.volume = Number(e.target.value);
-    video.muted = video.volume === 0;
-  });
-
-  $("fullscreen").addEventListener("click", () => {
-    const wrap = $("player-wrap");
-    if (wrap.requestFullscreen) wrap.requestFullscreen();
-    else video.webkitEnterFullscreen?.(); // iOS Safari
   });
 
   connect();
