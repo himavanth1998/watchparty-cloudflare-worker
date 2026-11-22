@@ -50,9 +50,14 @@ export default {
 };
 
 /**
- * One Durable Object per room. The host (whoever holds the room's hostKey)
- * drives playback; at most one viewer follows along. Uses the WebSocket
- * Hibernation API so idle rooms don't consume duration.
+ * One Durable Object per room. Both people can play, pause and seek; only the host
+ * (whoever holds the room's hostKey) can change the video. If either person's player
+ * is buffering, the room is "held": everyone pauses at the same position and playback
+ * resumes together once nobody is buffering. Uses the WebSocket Hibernation API so idle
+ * rooms don't consume duration.
+ *
+ * state = { url, playing (intent), time, updatedAt, reason, by, version, holding, waiting }
+ * `playing` is what people asked for; while `holding` is true nothing actually plays.
  */
 export class Room extends DurableObject {
   constructor(ctx, env) {
@@ -63,7 +68,7 @@ export class Room extends DurableObject {
   // Called over RPC by the Worker when creating a room. Returns false on id collision.
   async init(hostKey) {
     if (await this.ctx.storage.get("hostKey")) return false;
-    this.state = { url: null, playing: false, time: 0, updatedAt: Date.now(), reason: "load" };
+    this.state = { url: null, playing: false, time: 0, updatedAt: Date.now(), reason: "load", by: "host", version: 0, holding: false, waiting: [] };
     await this.ctx.storage.put({ hostKey, state: this.state });
     await this.ctx.storage.setAlarm(Date.now() + ROOM_TTL_MS);
     return true;
@@ -79,21 +84,28 @@ export class Room extends DurableObject {
     const key = new URL(request.url).searchParams.get("key");
     const role = key && key === hostKey ? "host" : "viewer";
 
-    if (role === "viewer" && this.isOnline("viewer")) {
+    // A browser id lets a refreshed/reopened guest replace their own stale connection
+    // (the server can still see the old socket as open for a while) without letting a third
+    // person kick them out.
+    const cid = (new URL(request.url).searchParams.get("cid") ?? "").slice(0, 64);
+    const olds = this.ctx.getWebSockets(role).filter((old) => old.readyState === WebSocket.OPEN);
+    if (role === "viewer" && olds.some((old) => old.deserializeAttachment()?.cid !== cid)) {
       return this.reject(client, server, 4001, "This room already has two people in it.");
     }
-    if (role === "host") {
-      // The host opened the room again (new tab / reload): the newest connection wins.
-      for (const old of this.ctx.getWebSockets("host")) {
-        this.safeSend(old, { type: "error", message: "You opened this room somewhere else." });
-        try { old.close(4000, "Replaced"); } catch {}
-      }
+    // The same person opened the room again (new tab / reload): the newest connection wins.
+    for (const old of olds) {
+      this.safeSend(old, { type: "error", message: "You opened this room somewhere else." });
+      try { old.close(4000, "Replaced"); } catch {}
     }
 
+    // Drop stale holds (e.g. the buffering person left) before the newcomer joins.
+    const state = await this.loadState();
+    await this.refreshHold(null);
+
     this.ctx.acceptWebSocket(server, [role]);
+    server.serializeAttachment({ buffering: false, cid });
     await this.ctx.storage.setAlarm(Date.now() + ROOM_TTL_MS);
 
-    const state = await this.loadState();
     this.safeSend(server, { type: "welcome", role, state: this.publicState(state) });
     this.broadcastPresence();
 
@@ -102,7 +114,7 @@ export class Room extends DurableObject {
 
   async webSocketMessage(ws, message) {
     const [role] = this.ctx.getTags(ws);
-    if (role !== "host" || typeof message !== "string" || message.length > MAX_URL_LENGTH + 512) return;
+    if (typeof message !== "string" || message.length > MAX_URL_LENGTH + 512) return;
 
     let msg;
     try {
@@ -110,38 +122,75 @@ export class Room extends DurableObject {
     } catch {
       return;
     }
-    if (msg?.type !== "update") return;
+    const state = await this.loadState();
+    if (!state) return;
 
-    const url = msg.url == null ? null : validHttpsUrl(msg.url);
-    if (msg.url != null && !url) {
-      this.safeSend(ws, { type: "error", message: "Only https:// URLs are allowed." });
+    if (msg?.type === "buffering") {
+      ws.serializeAttachment({ ...ws.deserializeAttachment(), buffering: Boolean(msg.buffering) });
+      const hint = Number(msg.time);
+      await this.refreshHold(Number.isFinite(hint) && hint >= 0 ? hint : null);
       return;
     }
+    if (msg?.type !== "update" || !REASONS.has(msg.reason)) return;
+
     const time = Number(msg.time);
     if (!Number.isFinite(time) || time < 0) return;
+    const now = Date.now();
 
-    this.state = {
-      url,
-      playing: Boolean(msg.playing),
-      time,
-      updatedAt: Date.now(),
-      reason: REASONS.has(msg.reason) ? msg.reason : "sync",
-    };
-    // Periodic syncs only live in memory to stay well inside the free-tier write quota;
-    // the last discrete event is enough to extrapolate position after hibernation.
-    if (this.state.reason !== "sync") await this.ctx.storage.put("state", this.state);
+    if (msg.reason === "sync") {
+      // Heartbeat for drift correction. Ignored if it was based on an outdated state
+      // (someone paused/seeked in the meantime) or while the room is held.
+      if (state.holding || !state.playing || msg.base !== state.version) return;
+      state.time = time;
+      state.updatedAt = now;
+      this.broadcast({ type: "state", state: this.publicState(state) }, ws);
+      return; // memory only, to stay well inside the free-tier write quota
+    }
 
-    for (const viewer of this.ctx.getWebSockets("viewer")) {
-      this.safeSend(viewer, { type: "state", state: this.publicState(this.state) });
+    if (msg.reason === "load") {
+      if (role !== "host") return; // only the host picks the video
+      const url = validHttpsUrl(msg.url);
+      if (!url) {
+        this.safeSend(ws, { type: "error", message: "Only https:// URLs are allowed." });
+        return;
+      }
+      state.url = url;
+      state.playing = Boolean(msg.playing);
+    } else {
+      if (!state.url) return;
+      if (msg.reason === "play") state.playing = true;
+      else if (msg.reason === "pause") state.playing = false;
+      // "seek" keeps the current intent
+    }
+
+    // Last write wins: whichever action reaches the room last defines the state.
+    state.time = time;
+    state.updatedAt = now;
+    state.reason = msg.reason;
+    state.by = role;
+    state.version++;
+    const waiting = this.waitingRoles();
+    state.holding = state.playing && waiting.length > 0;
+    state.waiting = state.holding ? waiting : [];
+    await this.ctx.storage.put("state", state);
+
+    const pub = { type: "state", state: this.publicState(state) };
+    if (state.holding) {
+      this.broadcast(pub); // the sender must pause too
+    } else {
+      this.broadcast(pub, ws);
+      this.safeSend(ws, { type: "ack", version: state.version });
     }
   }
 
   async webSocketClose(ws, code) {
     try { ws.close(code === 1005 ? 1000 : code, "Closing"); } catch {}
+    await this.refreshHold(null, ws);
     this.broadcastPresence(ws);
   }
 
   async webSocketError(ws) {
+    await this.refreshHold(null, ws);
     this.broadcastPresence(ws);
   }
 
@@ -154,14 +203,62 @@ export class Room extends DurableObject {
   }
 
   async loadState() {
-    this.state ??= await this.ctx.storage.get("state");
+    if (!this.state) {
+      const stored = await this.ctx.storage.get("state");
+      // Defaults cover rooms stored by older versions of this code.
+      if (stored) this.state = { holding: false, waiting: [], version: 0, by: "host", ...stored };
+    }
     return this.state;
+  }
+
+  // Roles whose player is currently buffering.
+  waitingRoles(exclude) {
+    const roles = new Set();
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws === exclude || ws.readyState !== WebSocket.OPEN) continue;
+      if (ws.deserializeAttachment()?.buffering) roles.add(this.ctx.getTags(ws)[0]);
+    }
+    return [...roles].sort();
+  }
+
+  // Start, update or end a hold depending on who is buffering. `timeHint` is the position of the
+  // person who just started buffering: everyone rewinds to it so nobody misses anything.
+  async refreshHold(timeHint, exclude) {
+    const state = await this.loadState();
+    if (!state) return;
+    const waiting = this.waitingRoles(exclude);
+    const holding = state.playing && waiting.length > 0;
+    const sameWaiting = waiting.join() === state.waiting.join();
+    if (holding === state.holding && (!holding || sameWaiting)) return;
+
+    const now = Date.now();
+    if (holding && !state.holding) {
+      // Freeze the clock at the buffering person's position.
+      state.time = timeHint ?? state.time + (now - state.updatedAt) / 1000;
+    }
+    // On resume the clock restarts from the frozen position.
+    state.updatedAt = now;
+    state.holding = holding;
+    state.waiting = holding ? waiting : [];
+    state.reason = holding ? "hold" : "resume";
+    state.version++;
+    await this.ctx.storage.put("state", state);
+    this.broadcast({ type: "state", state: this.publicState(state) }, exclude);
   }
 
   // Extrapolate the playback position to "now" so late joiners land in the right spot.
   publicState(state) {
-    const elapsed = state.playing ? (Date.now() - state.updatedAt) / 1000 : 0;
-    return { url: state.url, playing: state.playing, time: state.time + elapsed, reason: state.reason };
+    const live = state.playing && !state.holding;
+    const elapsed = live ? (Date.now() - state.updatedAt) / 1000 : 0;
+    return {
+      url: state.url,
+      playing: live,
+      time: state.time + elapsed,
+      reason: state.reason,
+      by: state.by,
+      version: state.version,
+      waiting: state.holding ? state.waiting : [],
+    };
   }
 
   isOnline(role, exclude) {
@@ -170,11 +267,14 @@ export class Room extends DurableObject {
       .some((ws) => ws !== exclude && ws.readyState === WebSocket.OPEN);
   }
 
-  broadcastPresence(exclude) {
-    const presence = { type: "presence", host: this.isOnline("host", exclude), viewer: this.isOnline("viewer", exclude) };
+  broadcast(data, exclude) {
     for (const ws of this.ctx.getWebSockets()) {
-      if (ws !== exclude) this.safeSend(ws, presence);
+      if (ws !== exclude) this.safeSend(ws, data);
     }
+  }
+
+  broadcastPresence(exclude) {
+    this.broadcast({ type: "presence", host: this.isOnline("host", exclude), viewer: this.isOnline("viewer", exclude) }, exclude);
   }
 
   safeSend(ws, data) {
