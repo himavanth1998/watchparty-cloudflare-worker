@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WatchTogether</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header><a href="/" class="logo">▶ WatchTogether</a></header>
+
+  <main>
+    <section id="home" hidden>
+      <form id="url-form" class="card">
+        <label for="url-input">Video URL</label>
+        <div class="row">
+          <input id="url-input" type="url" placeholder="https://example.com/video.mp4" required>
+          <button type="submit">Play</button>
+        </div>
+        <p class="hint">Any https URL your browser can play: MP4, WebM, MP3, and HLS (.m3u8) streams.</p>
+      </form>
+
+      <div class="card">
+        <h2>Watch together</h2>
+        <p class="hint">Create a room for two. You control the video and your friend's player follows you.
+          If you entered a URL above, the room starts with it.</p>
+        <div class="row">
+          <button id="create-room" type="button">Create room</button>
+        </div>
+        <form id="join-form" class="row">
+          <input id="join-input" placeholder="Room code or invite link" required>
+          <button type="submit" class="secondary">Join</button>
+        </form>
+      </div>
+    </section>
+
+    <section id="room" hidden>
+      <div class="card room-bar">
+        <span>Room <code id="room-code"></code></span>
+        <span id="role-badge" class="badge"></span>
+        <span id="presence" class="hint"></span>
+        <button id="copy-link" type="button" class="secondary" hidden>Copy invite link</button>
+      </div>
+      <form id="room-url-form" class="card" hidden>
+        <label for="room-url-input">Video URL</label>
+        <div class="row">
+          <input id="room-url-input" type="url" placeholder="https://example.com/video.mp4" required>
+          <button type="submit">Load for both</button>
+        </div>
+      </form>
+    </section>
+
+    <p id="message" class="message" hidden></p>
+
+    <div id="player-wrap" hidden>
+      <video id="video" playsinline preload="auto"></video>
+      <div id="overlay" hidden>
+        <button id="overlay-btn" type="button">▶ Click to start watching</button>
+      </div>
+    </div>
+
+    <div id="viewer-controls" class="card row" hidden>
+      <span class="hint">The host controls playback.</span>
+      <label class="inline">🔊 <input id="volume" type="range" min="0" max="1" step="0.05" value="1"></label>
+      <button id="fullscreen" type="button" class="secondary">Fullscreen</button>
+    </div>
+  </main>
+</body>
+</html>
