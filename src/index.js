@@ -36,6 +36,27 @@ export default {
       return new Response("Could not create a room, try again", { status: 500 });
     }
 
+    // Real-Debrid's API doesn't allow browser (CORS) requests, so the page asks us instead.
+    // The key is only forwarded, never stored.
+    const rdMatch = pathname.match(/^\/api\/rd\/mediaInfos\/([A-Za-z0-9]{1,64})$/);
+    if (rdMatch && request.method === "GET") {
+      const authorization = request.headers.get("Authorization");
+      if (!authorization) return Response.json({ error: "Missing API key" }, { status: 401 });
+      let res;
+      try {
+        res = await fetch(`https://app.real-debrid.com/rest/1.0/streaming/mediaInfos/${rdMatch[1]}`, {
+          headers: { Authorization: authorization },
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch {
+        return Response.json({ error: "Couldn't reach Real-Debrid" }, { status: 502 });
+      }
+      return new Response(res.body, {
+        status: res.status,
+        headers: { "Content-Type": res.headers.get("Content-Type") ?? "application/json", "Cache-Control": "no-store" },
+      });
+    }
+
     const wsMatch = pathname.match(/^\/api\/rooms\/([a-z0-9]{4,16})\/ws$/);
     if (wsMatch) {
       if (request.headers.get("Upgrade") !== "websocket") {
