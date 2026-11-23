@@ -24,6 +24,9 @@ function parseHttpsUrl(raw) {
   }
 }
 
+// Some manifests (e.g. Real-Debrid's) point at http:// segments, which an https page may not load.
+const upgradeToHttps = (url) => (location.protocol === "https:" ? String(url).replace(/^http:\/\//i, "https://") : url);
+
 function showMessage(text, kind = "error") {
   const el = $("message");
   el.textContent = text;
@@ -67,6 +70,7 @@ async function loadSource(url) {
     });
     dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, refreshTrackButtons);
     dash.on(dashjs.MediaPlayer.events.TEXT_TRACKS_ADDED, refreshTrackButtons);
+    dash.extend("RequestModifier", () => ({ modifyRequestHeader: (xhr) => xhr, modifyRequestURL: upgradeToHttps }), true);
     dash.initialize(video, url, false);
     return;
   }
@@ -78,7 +82,7 @@ async function loadSource(url) {
     const { default: Hls } = await import(HLS_MODULE);
     if (token !== loadToken) return;
     if (Hls.isSupported()) {
-      hls = new Hls();
+      hls = new Hls({ xhrSetup: (xhr, segmentUrl) => xhr.open("GET", upgradeToHttps(segmentUrl), true) });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (data.fatal) showMessage(`Couldn't play this stream (${data.details}). HLS needs the server to allow CORS.`);
       });
@@ -326,14 +330,236 @@ $("fullscreen-btn").addEventListener("click", () => {
   video.addEventListener("pause", wake);
 }
 
+// ---------- Real-Debrid ----------
+
+const RD_KEY_STORAGE = "wt-rd-key";
+const RD_API = "https://app.real-debrid.com/rest/1.0";
+const RD_STREAMING_LINK = /^https:\/\/(?:www\.)?real-debrid\.com\/streaming-([a-z0-9]+)\/?(?:[?#].*)?$/i;
+const RD_FORMAT_LABELS = { mpd: "DASH (.mpd)", m3u8: "HLS (.m3u8)", mp4: "MP4", webm: "WebM" };
+const rdKeyRenderers = [];
+
+const rdKey = () => localStorage.getItem(RD_KEY_STORAGE) ?? "";
+const rdStreamingId = (raw) => String(raw).trim().match(RD_STREAMING_LINK)?.[1] ?? null;
+
+function setRdKey(key) {
+  if (key) localStorage.setItem(RD_KEY_STORAGE, key);
+  else localStorage.removeItem(RD_KEY_STORAGE);
+  for (const render of rdKeyRenderers) render();
+}
+
+function makeEl(tag, props = {}, children = []) {
+  const el = Object.assign(document.createElement(tag), props);
+  el.append(...children);
+  return el;
+}
+
+const makeButton = (text, className, onClick) =>
+  makeEl("button", { type: "button", className, textContent: text, onclick: onClick });
+
+async function fetchMediaInfos(linkId, key) {
+  // The API wants the link's id without its trailing digits (streaming-ABC40 -> ABC).
+  const apiId = linkId.replace(/\d+$/, "") || linkId;
+  const init = () => ({ headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
+  let res;
+  try {
+    res = await fetch(`${RD_API}/streaming/mediaInfos/${apiId}`, init());
+  } catch {
+    // The browser can't reach the API directly (e.g. CORS): go through our Worker.
+    try {
+      res = await fetch(`/api/rd/mediaInfos/${apiId}`, init());
+    } catch {
+      throw new Error("Real-Debrid didn't answer, try again");
+    }
+  }
+  const body = await res.json().catch(() => null);
+  if (res.status === 401 || res.status === 403) throw new Error("Real-Debrid rejected the API key");
+  if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+  if (typeof body?.modelUrl !== "string") throw new Error("unexpected response from Real-Debrid");
+  return body;
+}
+
+// Values the stream's baseUrl uses for each {placeholder} of modelUrl (its default selection).
+function rdDefaults(info) {
+  const model = info.modelUrl.split("/");
+  const base = String(info.baseUrl ?? "").split("/");
+  const defaults = {};
+  model.forEach((segment, i) => {
+    const name = segment.match(/^\{(\w+)\}/)?.[1];
+    if (name && base[i]) defaults[name] = base[i].split(".")[0];
+  });
+  return defaults;
+}
+
+// Number repeated languages ("French 1", "French 2") so the options can be told apart.
+function rdTrackOptions(tracks, describe) {
+  const entries = Object.entries(tracks ?? {});
+  const counts = {};
+  for (const [, t] of entries) counts[t.lang] = (counts[t.lang] ?? 0) + 1;
+  const seen = {};
+  return entries.map(([value, t]) => {
+    seen[t.lang] = (seen[t.lang] ?? 0) + 1;
+    const lang = counts[t.lang] > 1 ? `${t.lang} ${seen[t.lang]}` : t.lang;
+    return [value, [lang, describe(t)].filter(Boolean).join(" · ")];
+  });
+}
+
+/**
+ * Adds the Real-Debrid API key editor and the stream options panel to a URL form. A
+ * real-debrid.com/streaming-… link in the input is looked up with the API, and the chosen
+ * audio, subtitles, quality and format are turned into the stream URL in the input.
+ * Returns a function for the submit handler: true if it took care of the submission.
+ */
+function setupRealDebrid(form, input) {
+  const panel = makeEl("div", { className: "rd-options", hidden: true });
+  const keyBox = makeEl("div", { className: "rd-key" });
+  form.prepend(panel);
+  form.append(keyBox);
+
+  let editing = false;
+  let lookup = 0;
+  let builtUrl = null;
+  let debounce = null;
+
+  function renderKey() {
+    const key = rdKey();
+    if (editing) {
+      const field = makeEl("input", {
+        type: "text", value: key, placeholder: "Paste your Real-Debrid API key",
+        autocomplete: "off", spellcheck: false,
+      });
+      const save = () => {
+        editing = false;
+        setRdKey(field.value.trim());
+        if (rdStreamingId(input.value)) resolve();
+      };
+      const cancel = () => {
+        editing = false;
+        renderKey();
+      };
+      field.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); save(); }
+        if (e.key === "Escape") cancel();
+      });
+      keyBox.replaceChildren(
+        makeEl("div", { className: "row" }, [
+          field,
+          makeButton("Save", "", save),
+          ...(key ? [makeButton("Cancel", "secondary", cancel)] : []),
+        ]),
+        makeEl("p", { className: "hint" }, [
+          "Get it from ",
+          makeEl("a", { href: "https://real-debrid.com/apitoken", target: "_blank", rel: "noopener", textContent: "real-debrid.com/apitoken" }),
+          ". It's stored only in this browser. Save an empty key to remove it.",
+        ]),
+      );
+      field.focus();
+    } else if (key) {
+      keyBox.replaceChildren(
+        makeEl("div", { className: "row hint" }, [
+          `Real-Debrid API key: ••••${key.slice(-4)}`,
+          makeButton("Edit", "secondary small", () => { editing = true; renderKey(); }),
+        ]),
+      );
+    } else {
+      keyBox.replaceChildren(
+        makeEl("div", { className: "row hint" }, [
+          "Have a real-debrid.com/streaming-… link?",
+          makeButton("Add Real-Debrid API key", "secondary small", () => { editing = true; renderKey(); }),
+        ]),
+      );
+    }
+  }
+  rdKeyRenderers.push(renderKey);
+  renderKey();
+
+  function renderOptions(info) {
+    const defaults = rdDefaults(info);
+    const audioCodec = defaults.audioCodec || "aac";
+    const select = (label, options, preferred) => {
+      const el = makeEl("select", {}, options.map(([value, text]) => makeEl("option", { value, textContent: text })));
+      if (options.some(([value]) => value === preferred)) el.value = preferred;
+      el.addEventListener("change", update);
+      return [el, makeEl("label", {}, [makeEl("span", { textContent: label }), el])];
+    };
+
+    const [audio, audioLabel] = select("Audio", rdTrackOptions(info.details?.audio, (a) =>
+      [a.codec, a.channels && `${a.channels} ch`].filter(Boolean).join(" ")), defaults.audio);
+    const [subtitles, subtitlesLabel] = select("Subtitles", [["none", "Off"], ...rdTrackOptions(info.details?.subtitles, (s) => s.type)],
+      defaults.subtitles ?? "none");
+    const [quality, qualityLabel] = select("Quality",
+      Object.entries(info.availableQualities ?? {}).map(([text, value]) => [value, text]), defaults.quality);
+    // DASH by default: it's the format this was built for, and hls.js/dash.js handle the rest.
+    const [format, formatLabel] = select("Format",
+      Object.values(info.availableFormats ?? {}).map((ext) => [ext, RD_FORMAT_LABELS[ext] ?? ext]),
+      Object.values(info.availableFormats ?? {}).includes("mpd") ? "mpd" : defaults.format);
+
+    function update() {
+      const values = { audio: audio.value, subtitles: subtitles.value, audioCodec, quality: quality.value, format: format.value };
+      builtUrl = info.modelUrl.replace(/\{(\w+)\}/g, (_, name) => encodeURIComponent(values[name] ?? ""));
+      input.value = builtUrl;
+    }
+
+    panel.replaceChildren(
+      makeEl("p", { className: "rd-title", textContent: info.filename ?? "Real-Debrid stream" }),
+      makeEl("div", { className: "rd-grid" }, [audioLabel, subtitlesLabel, qualityLabel, formatLabel]),
+      makeEl("p", { className: "hint", textContent: "Pick your options, then press the button to start the stream." }),
+    );
+    panel.hidden = false;
+    update();
+  }
+
+  async function resolve() {
+    const linkId = rdStreamingId(input.value);
+    if (!linkId) return;
+    clearTimeout(debounce);
+    const token = ++lookup;
+    const key = rdKey();
+    if (!key) {
+      editing = true;
+      renderKey();
+      return showMessage("Add your Real-Debrid API key to use Real-Debrid streaming links.");
+    }
+    showMessage("Looking up the Real-Debrid stream…", "info");
+    try {
+      const info = await fetchMediaInfos(linkId, key);
+      if (token !== lookup) return;
+      showMessage("");
+      renderOptions(info);
+    } catch (err) {
+      if (token === lookup) showMessage(`Couldn't load the Real-Debrid stream: ${err.message}`);
+    }
+  }
+
+  input.addEventListener("input", () => {
+    clearTimeout(debounce);
+    if (rdStreamingId(input.value)) {
+      debounce = setTimeout(resolve, 400);
+    } else if (input.value !== builtUrl) {
+      // The URL was replaced by something else: the options no longer apply.
+      lookup++;
+      builtUrl = null;
+      panel.hidden = true;
+    }
+  });
+
+  return () => {
+    if (!rdStreamingId(input.value)) return false;
+    resolve();
+    return true;
+  };
+}
+
 // ---------- home page ----------
 
 function startHome() {
   $("home").hidden = false;
   video.controls = true;
 
+  const realDebrid = setupRealDebrid($("url-form"), $("url-input"));
+
   $("url-form").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (realDebrid()) return;
     const url = parseHttpsUrl($("url-input").value);
     if (!url) return showMessage("Please enter a valid https:// URL.");
     await loadSource(url);
@@ -341,6 +567,7 @@ function startHome() {
   });
 
   $("create-room").addEventListener("click", async () => {
+    if (realDebrid()) return; // choose the stream options first
     const raw = $("url-input").value.trim();
     const url = raw ? parseHttpsUrl(raw) : null;
     if (raw && !url) return showMessage("Please enter a valid https:// URL, or leave it empty.");
@@ -509,8 +736,11 @@ function startRoom(roomId) {
     if (role === "host" && !video.paused && appliedPlaying && !myBuffering) sendUpdate("sync");
   }, SYNC_INTERVAL_MS);
 
+  const realDebrid = setupRealDebrid($("room-url-form"), $("room-url-input"));
+
   $("room-url-form").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (realDebrid()) return;
     const url = parseHttpsUrl($("room-url-input").value);
     if (!url) return showMessage("Please enter a valid https:// URL.");
     await loadSource(url);
