@@ -6,6 +6,26 @@ const HLS_MODULE = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.mjs";
 const DASH_SCRIPT = "https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js";
 const SYNC_INTERVAL_MS = 4000;
 
+// Servers that convert the video while you watch (e.g. Real-Debrid) answer with an error for
+// parts they haven't prepared yet, like right after a long jump ahead. Keep asking for about
+// two minutes instead of giving up (hls.js normally doesn't retry 4xx answers at all).
+const SEGMENT_RETRIES = 60;
+const SEGMENT_RETRY_MS = 2000;
+const SEGMENT_LOAD_POLICY = {
+  maxTimeToFirstByteMs: 30000,
+  maxLoadTimeMs: 120000,
+  timeoutRetry: { maxNumRetry: 4, retryDelayMs: 0, maxRetryDelayMs: 0 },
+  errorRetry: {
+    maxNumRetry: SEGMENT_RETRIES,
+    retryDelayMs: SEGMENT_RETRY_MS,
+    maxRetryDelayMs: SEGMENT_RETRY_MS,
+    backoff: "linear",
+    // Retry everything except a refused login: a missing segment may just not be ready yet.
+    shouldRetry: (config, retryCount, _isTimeout, response) =>
+      retryCount < config.maxNumRetry && response?.code !== 401 && response?.code !== 403,
+  },
+};
+
 // ---------- shared player helpers ----------
 
 let hls = null;
@@ -46,7 +66,6 @@ async function loadSource(url) {
     dash = null;
   }
   closeTrackMenu();
-  removeSubtitleFiles();
   video.removeAttribute("src");
   video.load();
   if (!url) return;
@@ -70,6 +89,12 @@ async function loadSource(url) {
     });
     dash.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, refreshTrackButtons);
     dash.on(dashjs.MediaPlayer.events.TEXT_TRACKS_ADDED, refreshTrackButtons);
+    dash.updateSettings({
+      streaming: {
+        retryAttempts: { MediaSegment: SEGMENT_RETRIES },
+        retryIntervals: { MediaSegment: SEGMENT_RETRY_MS },
+      },
+    });
     dash.extend("RequestModifier", () => ({ modifyRequestHeader: (xhr) => xhr, modifyRequestURL: upgradeToHttps }), true);
     dash.initialize(video, url, false);
     return;
@@ -77,14 +102,24 @@ async function loadSource(url) {
 
   const isHls = pathname.endsWith(".m3u8");
   // Prefer hls.js even where HLS plays natively (Safari, recent Chrome): native playback
-  // doesn't expose audio/subtitle track switching in most browsers.
+  // doesn't expose audio track switching in most browsers.
   if (isHls) {
     const { default: Hls } = await import(HLS_MODULE);
     if (token !== loadToken) return;
     if (Hls.isSupported()) {
-      hls = new Hls({ xhrSetup: (xhr, segmentUrl) => xhr.open("GET", upgradeToHttps(segmentUrl), true) });
+      hls = new Hls({
+        xhrSetup: (xhr, segmentUrl) => xhr.open("GET", upgradeToHttps(segmentUrl), true),
+        fragLoadPolicy: { default: SEGMENT_LOAD_POLICY },
+      });
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) showMessage(`Couldn't play this stream (${data.details}). HLS needs the server to allow CORS.`);
+        if (data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR && !data.fatal) {
+          showMessage("Waiting for the server to prepare this part of the video…", "info");
+        } else if (data.fatal) {
+          showMessage(`Couldn't play this stream (${data.details}). HLS needs the server to allow CORS.`);
+        }
+      });
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        if ($("message").textContent.startsWith("Waiting for the server")) showMessage("");
       });
       hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, refreshTrackButtons);
       hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, refreshTrackButtons);
@@ -131,11 +166,10 @@ video.addEventListener("error", () => {
   );
 });
 
-// ---------- audio & subtitle tracks ----------
-// Choices are per person: each browser picks its own audio language and subtitles.
+// ---------- audio tracks & seek buttons ----------
+// Choices are per person: each browser picks its own audio language.
 
 const trackMenu = $("track-menu");
-const subtitleFiles = []; // { el: <track>, url } loaded from the user's disk
 let menuKind = null;
 
 function trackLabel(parts, index) {
@@ -167,61 +201,6 @@ function audioOptions() {
   }));
 }
 
-function subtitleOptions() {
-  const showFile = (track) => subtitleFiles.forEach(({ el }) => (el.track.mode = el.track === track ? "showing" : "disabled"));
-
-  if (!hls && !dash) {
-    // Native tracks (including loaded files) all live in video.textTracks.
-    const tracks = Array.from(video.textTracks).filter((t) => t.kind === "subtitles" || t.kind === "captions");
-    return {
-      options: tracks.map((t, i) => ({
-        track: t,
-        label: trackLabel([t.label, t.language], i),
-        active: t.mode === "showing",
-        select: () => tracks.forEach((o) => (o.mode = o === t ? "showing" : "disabled")),
-      })),
-      off: () => tracks.forEach((t) => (t.mode = "disabled")),
-    };
-  }
-
-  let options, libOff;
-  if (hls) {
-    libOff = () => (hls.subtitleTrack = -1);
-    options = hls.subtitleTracks.map((t, i) => ({
-      label: trackLabel([t.name, t.lang], i),
-      active: hls.subtitleDisplay && hls.subtitleTrack === i,
-      select: () => {
-        showFile(null);
-        hls.subtitleDisplay = true;
-        hls.subtitleTrack = i;
-      },
-    }));
-  } else {
-    libOff = () => dash.setTextTrack(-1);
-    options = dash.getTracksFor("text").map((t, i) => ({
-      label: trackLabel([t.labels?.[0]?.text, t.lang], i),
-      active: dash.isTextEnabled() && dash.getCurrentTextTrackIndex() === i,
-      select: () => {
-        showFile(null);
-        dash.enableText(true);
-        dash.setTextTrack(i);
-      },
-    }));
-  }
-  for (const { el } of subtitleFiles) {
-    options.push({
-      track: el.track,
-      label: el.label,
-      active: el.track.mode === "showing",
-      select: () => {
-        libOff();
-        showFile(el.track);
-      },
-    });
-  }
-  return { options, off: () => (libOff(), showFile(null)) };
-}
-
 function refreshTrackButtons() {
   $("audio-btn").hidden = audioOptions().length < 2;
 }
@@ -246,18 +225,11 @@ function openTrackMenu(kind) {
     trackMenu.append(button);
   };
 
-  if (kind === "audio") {
-    for (const o of audioOptions()) {
-      add(o.label, o.active, () => {
-        programmaticSeek = video.currentTime; // some players re-seek to flush the old audio
-        o.select();
-      });
-    }
-  } else {
-    const { options, off } = subtitleOptions();
-    add("Off", !options.some((o) => o.active), off);
-    for (const o of options) add(o.label, o.active, o.select);
-    add("Load subtitle file (.srt / .vtt)…", false, () => $("subtitle-file").click());
+  for (const o of audioOptions()) {
+    add(o.label, o.active, () => {
+      programmaticSeek = video.currentTime; // some players re-seek to flush the old audio
+      o.select();
+    });
   }
   trackMenu.hidden = false;
   $("player-wrap").classList.add("menu-open");
@@ -269,34 +241,7 @@ function closeTrackMenu() {
   $("player-wrap").classList.remove("menu-open");
 }
 
-function removeSubtitleFiles() {
-  for (const { el, url } of subtitleFiles.splice(0)) {
-    el.remove();
-    URL.revokeObjectURL(url);
-  }
-}
-
-$("subtitle-file").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  e.target.value = "";
-  if (!file) return;
-  let text = (await file.text()).replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
-  if (!text.startsWith("WEBVTT")) {
-    // SRT -> WebVTT: apart from the header, only the millisecond separator differs.
-    text = "WEBVTT\n\n" + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
-  }
-  const url = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
-  const el = document.createElement("track");
-  el.kind = "subtitles";
-  el.label = file.name.replace(/\.(srt|vtt)$/i, "");
-  el.src = url;
-  video.append(el);
-  subtitleFiles.push({ el, url });
-  subtitleOptions().options.find((o) => o.track === el.track)?.select();
-});
-
 $("audio-btn").addEventListener("click", () => openTrackMenu("audio"));
-$("subtitle-btn").addEventListener("click", () => openTrackMenu("subtitles"));
 document.addEventListener("click", (e) => {
   if (menuKind && !e.target.closest("#track-controls")) closeTrackMenu();
 });
@@ -306,15 +251,23 @@ document.addEventListener("keydown", (e) => {
 video.addEventListener("loadedmetadata", refreshTrackButtons);
 video.audioTracks?.addEventListener?.("addtrack", refreshTrackButtons);
 
-// Fullscreen the wrapper (not the bare <video>) so the track buttons stay visible.
-$("fullscreen-btn").addEventListener("click", () => {
-  const wrap = $("player-wrap");
-  if (document.fullscreenElement) document.exitFullscreen();
-  else if (wrap.requestFullscreen) wrap.requestFullscreen().catch(() => {});
-  else video.webkitEnterFullscreen?.(); // iOS Safari: native player has its own track menu
+// Jump back/ahead. In a room this is an ordinary seek, so it's shared like any other.
+function skip(seconds) {
+  if (!currentUrl) return;
+  const end = Number.isFinite(video.duration) ? video.duration : Infinity;
+  video.currentTime = Math.min(Math.max(video.currentTime + seconds, 0), end);
+}
+$("back-btn").addEventListener("click", () => skip(-10));
+$("forward-btn").addEventListener("click", () => skip(10));
+// Arrow keys too, which also work in fullscreen where the buttons aren't shown.
+document.addEventListener("keydown", (e) => {
+  if ($("player-wrap").hidden || e.target.closest?.("input, textarea, select")) return;
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  skip(e.key === "ArrowLeft" ? -10 : 10);
 });
 
-// Fade the buttons out while playing, like the native controls.
+// Fade the overlay buttons out while playing, like the native controls.
 {
   const wrap = $("player-wrap");
   let idleTimer;
@@ -333,7 +286,6 @@ $("fullscreen-btn").addEventListener("click", () => {
 // ---------- Real-Debrid ----------
 
 const RD_KEY_STORAGE = "wt-rd-key";
-const RD_API = "https://app.real-debrid.com/rest/1.0";
 const RD_STREAMING_LINK = /^https:\/\/(?:www\.)?real-debrid\.com\/streaming-([a-z0-9]+)\/?(?:[?#].*)?$/i;
 const RD_FORMAT_LABELS = { mpd: "DASH (.mpd)", m3u8: "HLS (.m3u8)", mp4: "MP4", webm: "WebM" };
 const rdKeyRenderers = [];
@@ -359,17 +311,18 @@ const makeButton = (text, className, onClick) =>
 async function fetchMediaInfos(linkId, key) {
   // The API wants the link's id without its trailing digits (streaming-ABC40 -> ABC).
   const apiId = linkId.replace(/\d+$/, "") || linkId;
-  const init = () => ({ headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15000) });
   let res;
   try {
-    res = await fetch(`${RD_API}/streaming/mediaInfos/${apiId}`, init());
+    // Real-Debrid's API doesn't allow browser (CORS) requests, so our Worker relays the call.
+    res = await fetch(`/api/rd/mediaInfos/${apiId}`, {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(15000),
+    });
   } catch {
-    // The browser can't reach the API directly (e.g. CORS): go through our Worker.
-    try {
-      res = await fetch(`/api/rd/mediaInfos/${apiId}`, init());
-    } catch {
-      throw new Error("Real-Debrid didn't answer, try again");
-    }
+    throw new Error("Real-Debrid didn't answer, try again");
+  }
+  if (res.status === 404 && !res.headers.get("content-type")?.includes("json")) {
+    throw new Error("this site's Worker is missing the Real-Debrid route (redeploy src/index.js)");
   }
   const body = await res.json().catch(() => null);
   if (res.status === 401 || res.status === 403) throw new Error("Real-Debrid rejected the API key");
@@ -551,8 +504,92 @@ function setupRealDebrid(form, input) {
 
 // ---------- home page ----------
 
+function timeAgo(ms) {
+  const minutes = Math.round(Math.abs(ms) / 60000);
+  if (minutes < 1) return "less than a minute";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+// A readable name for the room's video: the file name from its URL.
+function videoTitle(url) {
+  if (!url) return "No video yet";
+  try {
+    const { pathname, hostname } = new URL(url);
+    const file = decodeURIComponent(pathname.split("/").filter(Boolean).pop() ?? "");
+    return file || hostname;
+  } catch {
+    return url;
+  }
+}
+
+// Rooms this browser holds the host key for (saved when the room was created).
+async function renderMyRooms() {
+  const rooms = Object.keys(localStorage)
+    .filter((k) => k.startsWith("wt-host:"))
+    .map((k) => ({ roomId: k.slice("wt-host:".length), hostKey: localStorage.getItem(k) }));
+  if (!rooms.length) {
+    $("my-rooms").hidden = true;
+    return;
+  }
+
+  const results = await Promise.all(
+    rooms.map(async (room) => {
+      try {
+        const res = await fetch(`/api/rooms/${room.roomId}`, { headers: { "X-Host-Key": room.hostKey } });
+        if (res.status === 404) {
+          localStorage.removeItem(`wt-host:${room.roomId}`); // expired or deleted
+          return null;
+        }
+        return res.ok ? { ...room, info: await res.json() } : { ...room, info: null };
+      } catch {
+        return { ...room, info: null };
+      }
+    }),
+  );
+  const live = results.filter(Boolean).sort((a, b) => (b.info?.lastActiveAt ?? 0) - (a.info?.lastActiveAt ?? 0));
+  $("my-rooms").hidden = !live.length;
+  $("room-list").replaceChildren(
+    ...live.map(({ roomId, hostKey, info }) => {
+      const details = [];
+      if (info) {
+        const now = Date.now();
+        if (info.online.host || info.online.viewer) {
+          details.push(`🟢 ${[info.online.host && "you", info.online.viewer && (info.guestName ?? "your guest")].filter(Boolean).join(" and ")} connected`);
+        } else if (info.lastActiveAt) {
+          details.push(`Last used ${timeAgo(now - info.lastActiveAt)} ago`);
+        }
+        if (info.guestName) details.push(`Guest: ${info.guestName}`);
+        if (info.messages) details.push(`${info.messages} message${info.messages === 1 ? "" : "s"}`);
+        if (info.expiresAt && !info.online.host && !info.online.viewer) details.push(`deleted in ${timeAgo(info.expiresAt - now)}`);
+      } else {
+        details.push("Couldn't load details");
+      }
+      const remove = makeButton("Delete", "secondary small", async () => {
+        if (!confirm(`Delete room ${roomId}? This also deletes its chat, and the invite link stops working.`)) return;
+        const res = await fetch(`/api/rooms/${roomId}`, { method: "DELETE", headers: { "X-Host-Key": hostKey } }).catch(() => null);
+        if (!res || (!res.ok && res.status !== 404)) return showMessage("Couldn't delete the room, try again.");
+        localStorage.removeItem(`wt-host:${roomId}`);
+        renderMyRooms();
+      });
+      return makeEl("li", {}, [
+        makeEl("div", { className: "room-info" }, [
+          makeEl("span", { className: "room-title", textContent: videoTitle(info?.url) }),
+          makeEl("span", { className: "hint", textContent: `Room ${roomId}${details.length ? " · " + details.join(" · ") : ""}` }),
+        ]),
+        makeEl("a", { href: `/room/${roomId}`, className: "button", textContent: "Open" }),
+        remove,
+      ]);
+    }),
+  );
+}
+
 function startHome() {
   $("home").hidden = false;
+  renderMyRooms();
   video.controls = true;
 
   const realDebrid = setupRealDebrid($("url-form"), $("url-input"));
@@ -611,6 +648,7 @@ function startRoom(roomId) {
   let appliedPlaying = false; // what the room last told our player to do
   let myBuffering = false; // we told the room our player is stalled
   let waitingShown = false;
+  let myName = "";
 
   $("room").hidden = false;
   $("room-code").textContent = roomId;
@@ -618,7 +656,7 @@ function startRoom(roomId) {
 
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const query = `?cid=${clientId}${hostKey ? `&key=${encodeURIComponent(hostKey)}` : ""}`;
+    const query = `?cid=${clientId}&name=${encodeURIComponent(myName)}${hostKey ? `&key=${encodeURIComponent(hostKey)}` : ""}`;
     ws = new WebSocket(`${proto}://${location.host}/api/rooms/${roomId}/ws${query}`);
 
     ws.addEventListener("open", () => {
@@ -639,7 +677,12 @@ function startRoom(roomId) {
       case "welcome":
         setRole(msg.role);
         version = msg.state.version;
+        $("chat-log").replaceChildren();
+        for (const m of msg.chat ?? []) addChatMessage(m);
         resume(msg.state);
+        break;
+      case "chat":
+        addChatMessage(msg.message);
         break;
       case "state":
         version = msg.state.version;
@@ -674,12 +717,36 @@ function startRoom(roomId) {
     }
   }
 
-  function renderPresence({ host, viewer }) {
+  function renderPresence({ host, viewer, hostName, viewerName }) {
     $("presence").textContent =
       role === "host"
-        ? viewer ? "🟢 Your friend is here" : "⚪ Waiting for your friend to join…"
-        : host ? "🟢 Host is online" : "⚪ Host is offline";
+        ? viewer ? `🟢 ${viewerName ?? "Your friend"} is here` : "⚪ Waiting for your friend to join…"
+        : host ? `🟢 ${hostName ?? "Host"} (host) is online` : "⚪ Host is offline";
   }
+
+  // ----- chat -----
+
+  function addChatMessage({ from, name, text, at }) {
+    const log = $("chat-log");
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+    const time = new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    log.append(
+      makeEl("li", { className: from === role ? "mine" : "" }, [
+        makeEl("span", { className: "meta", textContent: `${from === role ? "You" : name} · ${time}` }),
+        text,
+      ]),
+    );
+    if (nearBottom || from === role) log.scrollTop = log.scrollHeight;
+  }
+
+  $("chat-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = $("chat-input").value.trim();
+    if (!text) return;
+    if (ws?.readyState !== WebSocket.OPEN) return showMessage("Not connected, the message wasn't sent.");
+    ws.send(JSON.stringify({ type: "chat", text }));
+    $("chat-input").value = "";
+  });
 
   // ----- sending -----
 
@@ -841,7 +908,22 @@ function startRoom(roomId) {
     applyState();
   });
 
-  connect();
+  // Everyone enters a name before joining. The click also lets the browser start playback with sound.
+  $("name-input").value = localStorage.getItem("wt-name") ?? "";
+  $("name-form").hidden = false;
+  $("name-input").focus();
+  $("name-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    myName = $("name-input").value.replace(/\s+/g, " ").trim();
+    if (!myName) return showMessage("Please enter your name.");
+    localStorage.setItem("wt-name", myName);
+    showMessage("");
+    unlocked = true;
+    $("name-form").hidden = true;
+    $("room-bar").hidden = false;
+    $("chat").hidden = false;
+    connect();
+  });
 }
 
 // ---------- router ----------

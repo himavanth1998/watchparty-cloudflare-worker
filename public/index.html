@@ -33,10 +33,23 @@
           <button type="submit" class="secondary">Join</button>
         </form>
       </div>
+
+      <div id="my-rooms" class="card" hidden>
+        <h2>Your rooms</h2>
+        <p class="hint">Rooms you host from this browser. A room is deleted 7 days after the last person leaves it.</p>
+        <ul id="room-list"></ul>
+      </div>
     </section>
 
     <section id="room" hidden>
-      <div class="card room-bar">
+      <form id="name-form" class="card" hidden>
+        <label for="name-input">Your name</label>
+        <div class="row">
+          <input id="name-input" type="text" maxlength="40" autocomplete="nickname" placeholder="So your friend knows who's here" required>
+          <button type="submit">Join room</button>
+        </div>
+      </form>
+      <div id="room-bar" class="card room-bar" hidden>
         <span>Room <code id="room-code"></code></span>
         <span id="role-badge" class="badge"></span>
         <span id="presence" class="hint"></span>
@@ -54,25 +67,34 @@
     <p id="message" class="message" hidden></p>
 
     <div id="player-wrap" hidden>
-      <video id="video" playsinline preload="auto" controlslist="nofullscreen"></video>
-      <div id="track-controls">
+      <video id="video" playsinline preload="auto"></video>
+      <div id="seek-controls" class="player-buttons">
+        <button id="back-btn" class="icon-btn" type="button" title="Back 10 seconds (←)" aria-label="Back 10 seconds">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2L7 6l5 4V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/><text x="12" y="16.5" text-anchor="middle" font-size="7" font-weight="700" font-family="system-ui, sans-serif">10</text></svg>
+        </button>
+        <button id="forward-btn" class="icon-btn" type="button" title="Forward 10 seconds (→)" aria-label="Forward 10 seconds">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V2l5 4-5 4V7a6 6 0 1 0 6 6h2a8 8 0 1 1-8-8z"/><text x="12" y="16.5" text-anchor="middle" font-size="7" font-weight="700" font-family="system-ui, sans-serif">10</text></svg>
+        </button>
+      </div>
+      <div id="track-controls" class="player-buttons">
         <button id="audio-btn" class="icon-btn" type="button" title="Audio track" aria-label="Audio track" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 0 0-9 9v7a2 2 0 0 0 2 2h2v-8H5v-1a7 7 0 0 1 14 0v1h-2v8h2a2 2 0 0 0 2-2v-7a9 9 0 0 0-9-9z"/></svg>
         </button>
-        <button id="subtitle-btn" class="icon-btn" type="button" title="Subtitles" aria-label="Subtitles">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1z"/></svg>
-        </button>
-        <button id="fullscreen-btn" class="icon-btn" type="button" title="Fullscreen" aria-label="Fullscreen">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
-        </button>
         <div id="track-menu" role="menu" hidden></div>
       </div>
-      <input id="subtitle-file" type="file" accept=".srt,.vtt" hidden>
       <div id="overlay" hidden>
         <button id="overlay-btn" type="button">▶ Click to start watching</button>
       </div>
     </div>
 
+    <div id="chat" class="card" hidden>
+      <h2>Chat</h2>
+      <ol id="chat-log" aria-live="polite"></ol>
+      <form id="chat-form" class="row">
+        <input id="chat-input" type="text" maxlength="500" autocomplete="off" placeholder="Type a message…" required>
+        <button type="submit">Send</button>
+      </form>
+    </div>
   </main>
 </body>
 </html>

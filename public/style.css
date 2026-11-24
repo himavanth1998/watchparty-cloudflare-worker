@@ -82,6 +82,15 @@ button {
   font-weight: 600;
   cursor: pointer;
 }
+a.button {
+  display: inline-block;
+  padding: 4px 14px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  text-decoration: none;
+}
 button.secondary {
   background: transparent;
   border: 1px solid var(--border);
@@ -160,19 +169,18 @@ video {
   background: black;
 }
 
-#player-wrap:fullscreen { display: grid; place-items: center; border-radius: 0; }
-#player-wrap:fullscreen video { max-height: 100vh; height: 100vh; }
 
-#track-controls {
+.player-buttons {
   position: absolute;
   top: 10px;
-  right: 10px;
   z-index: 2;
   display: flex;
   gap: 6px;
   transition: opacity 0.3s;
 }
-#player-wrap.idle:not(.menu-open) #track-controls { opacity: 0; pointer-events: none; }
+#seek-controls { left: 10px; }
+#track-controls { right: 10px; }
+#player-wrap.idle:not(.menu-open) .player-buttons { opacity: 0; pointer-events: none; }
 
 .icon-btn {
   width: 40px;
@@ -218,3 +226,39 @@ video {
   background: rgba(0, 0, 0, 0.6);
 }
 #overlay-btn { font-size: 1.2rem; padding: 14px 24px; }
+
+#chat-log {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#chat-log:empty::before { content: "No messages yet."; color: var(--muted); font-size: 0.9rem; }
+#chat-log li {
+  align-self: flex-start;
+  max-width: 80%;
+  padding: 6px 12px;
+  border-radius: 12px;
+  background: var(--border);
+  overflow-wrap: anywhere;
+}
+#chat-log li.mine { align-self: flex-end; background: var(--accent); }
+#chat-log .meta { display: block; font-size: 0.75rem; opacity: 0.75; }
+
+#room-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+#room-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+#room-list .room-info { flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 2px; }
+#room-list .room-title { font-weight: 600; overflow-wrap: anywhere; }
+#room-list .hint { margin: 0; }
