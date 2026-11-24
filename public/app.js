@@ -5,6 +5,12 @@ const HLS_MODULE = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.mjs";
 // UMD build (sets window.dashjs); pinned because dash.js 5 changed the track APIs used below.
 const DASH_SCRIPT = "https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js";
 const SYNC_INTERVAL_MS = 4000;
+// Sync tuning. Small, automatic position changes (the player nudging itself past a stall, or a
+// hold snapping everyone to the same frame) must not bounce between the two players.
+const MIN_SHARED_SEEK = 1.5; // seeks closer than this to the room's position aren't shared
+const STALL_REPORT_MS = 700; // only stalls longer than this make both people wait
+const GAP_ESCAPE_MS = 2000; // stuck this long before a gap in the downloaded video: jump it
+const MAX_GAP_JUMP = 3; // ...if the gap is at most this many seconds
 const SKIP_SECONDS = 10; // the ⟲/⟳ buttons and the ←/→ keys
 const KEY_REPEAT_MS = 400; // while an arrow key is held down, skip at most this often
 // Heartbeat: a connection can die without the browser noticing (Wi-Fi drop, sleep, a phone
@@ -664,6 +670,9 @@ function startRoom(roomId) {
   let version = 0; // newest room state version we know about
   let appliedPlaying = false; // what the room last told our player to do
   let myBuffering = false; // we told the room our player is stalled
+  let bufferingSince = 0;
+  let stallTimer = null;
+  let shareNextSeek = false; // the next seek is ours but the room must hear about it
   let waitingShown = false;
   let myName = "";
 
@@ -830,17 +839,42 @@ function startRoom(roomId) {
     };
     if (reason === "load") msg.url = currentUrl;
     ws.send(JSON.stringify(msg));
+    if (reason !== "sync" && latest) {
+      // Our own action is now the room's position (the server only acks it).
+      latest = { ...latest, time: msg.time, playing: msg.playing, reason, receivedAt: performance.now() };
+    }
+  }
+
+  // Where the room's playback should be right now, according to the latest state.
+  function roomTime() {
+    if (!latest) return NaN;
+    return latest.time + (latest.playing ? (performance.now() - latest.receivedAt) / 1000 : 0);
   }
 
   // Tell the room when our player stalls or recovers so both sides can wait for each other.
   function setBuffering(buffering) {
     if (myBuffering === buffering || ws?.readyState !== WebSocket.OPEN) return;
     myBuffering = buffering;
+    bufferingSince = performance.now();
     ws.send(JSON.stringify({ type: "buffering", buffering, time: video.currentTime || 0 }));
   }
 
   function checkReady() {
-    if (myBuffering && video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) setBuffering(false);
+    if (!myBuffering) return;
+    if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return setBuffering(false);
+    // Stuck right before a gap in what's been downloaded (streams converted on the fly can have
+    // them after a jump). hls.js only jumps gaps while playing, and during a hold we're paused,
+    // so both people would wait forever. Jump it ourselves and tell the room.
+    if (video.seeking || performance.now() - bufferingSince < GAP_ESCAPE_MS) return;
+    const t = video.currentTime;
+    for (let i = 0; i < video.buffered.length; i++) {
+      const start = video.buffered.start(i);
+      if (start > t && start - t <= MAX_GAP_JUMP) {
+        shareNextSeek = true;
+        video.currentTime = start + 0.05;
+        return;
+      }
+    }
   }
 
   // Events caused by applyState() match what the room already knows, so only genuine
@@ -858,10 +892,23 @@ function startRoom(roomId) {
   video.addEventListener("seeked", () => {
     const ours = programmaticSeek !== null && Math.abs(video.currentTime - programmaticSeek) < 0.5;
     programmaticSeek = null;
-    if (!ours) sendUpdate("seek");
+    if (ours) return;
+    if (shareNextSeek) {
+      shareNextSeek = false;
+      return sendUpdate("seek");
+    }
+    // Not a person seeking: the player correcting itself by a fraction of a second. Sharing
+    // those made both players keep re-seeking each other to the same spot.
+    if (Math.abs(video.currentTime - roomTime()) < MIN_SHARED_SEEK) return;
+    sendUpdate("seek");
   });
   video.addEventListener("waiting", () => {
-    if (!video.paused && appliedPlaying) setBuffering(true);
+    if (video.paused || !appliedPlaying) return;
+    clearTimeout(stallTimer);
+    // Brief stalls sort themselves out; only make both people wait for a real one.
+    stallTimer = setTimeout(() => {
+      if (!video.paused && appliedPlaying && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) setBuffering(true);
+    }, STALL_REPORT_MS);
   });
   video.addEventListener("canplay", checkReady);
   video.addEventListener("playing", checkReady);
@@ -950,7 +997,9 @@ function startRoom(roomId) {
     if (latest !== s) return;
 
     const target = s.time + (s.playing ? (performance.now() - s.receivedAt) / 1000 : 0);
-    const tolerance = s.reason === "sync" ? 1.0 : 0.3;
+    // Someone's deliberate action is matched closely; drift corrections and holds/resumes only
+    // fix real differences, so they can't pull a player back to a spot it just got past.
+    const tolerance = ["sync", "hold", "resume"].includes(s.reason) ? 1.0 : 0.5;
     if (Math.abs(video.currentTime - target) > tolerance) {
       programmaticSeek = target;
       video.currentTime = target;
