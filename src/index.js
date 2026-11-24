@@ -101,6 +101,8 @@ export class Room extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.state = null;
+    // Heartbeats from the page are answered without waking the room.
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   // Called over RPC by the Worker when creating a room. Returns false on id collision.

@@ -5,6 +5,11 @@ const HLS_MODULE = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.mjs";
 // UMD build (sets window.dashjs); pinned because dash.js 5 changed the track APIs used below.
 const DASH_SCRIPT = "https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js";
 const SYNC_INTERVAL_MS = 4000;
+// Heartbeat: a connection can die without the browser noticing (Wi-Fi drop, sleep, a phone
+// locking), which left one person playing on alone. Ping often and reconnect if the room goes quiet.
+const PING_INTERVAL_MS = 5000;
+const SILENCE_LIMIT_MS = 12000; // no message (or pong) for this long = dead connection
+const CONNECT_TIMEOUT_MS = 10000;
 
 // Servers that convert the video while you watch (e.g. Real-Debrid) answer with an error for
 // parts they haven't prepared yet, like right after a long jump ahead. Keep asking for about
@@ -641,6 +646,9 @@ function startRoom(roomId) {
   let ws = null;
   let role = null;
   let retryDelay = 1000;
+  let reconnectTimer = null;
+  let connectStartedAt = 0;
+  let lastHeard = 0; // when the room last sent us anything
   let stopped = false;
   let unlocked = false; // the browser allows playback with sound (the user has clicked)
   let latest = null; // latest room state received, with receivedAt
@@ -655,22 +663,74 @@ function startRoom(roomId) {
   video.controls = true; // both people can play, pause and seek
 
   function connect() {
+    clearTimeout(reconnectTimer);
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const query = `?cid=${clientId}&name=${encodeURIComponent(myName)}${hostKey ? `&key=${encodeURIComponent(hostKey)}` : ""}`;
-    ws = new WebSocket(`${proto}://${location.host}/api/rooms/${roomId}/ws${query}`);
+    const socket = new WebSocket(`${proto}://${location.host}/api/rooms/${roomId}/ws${query}`);
+    ws = socket;
+    connectStartedAt = lastHeard = performance.now();
 
-    ws.addEventListener("open", () => {
+    // Events from a socket we've already given up on are ignored.
+    socket.addEventListener("open", () => {
+      if (socket !== ws) return;
       retryDelay = 1000;
+      lastHeard = performance.now();
       myBuffering = false; // a fresh connection starts with a clean buffering flag
     });
-    ws.addEventListener("message", (e) => handleMessage(JSON.parse(e.data)));
-    ws.addEventListener("close", (e) => {
-      if (stopped || [4000, 4001, 4004].includes(e.code)) return;
-      $("presence").textContent = "Reconnecting…";
-      setTimeout(connect, retryDelay);
-      retryDelay = Math.min(retryDelay * 2, 15000);
+    socket.addEventListener("message", (e) => {
+      if (socket !== ws) return;
+      lastHeard = performance.now();
+      if (e.data !== "pong") handleMessage(JSON.parse(e.data));
+    });
+    socket.addEventListener("close", (e) => {
+      if (socket !== ws || stopped || [4000, 4001, 4004].includes(e.code)) return;
+      scheduleReconnect();
     });
   }
+
+  function scheduleReconnect() {
+    $("presence").textContent = "Reconnecting…";
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 15000);
+  }
+
+  // Abandon the current connection without waiting for the browser's close event, which can
+  // take a minute or more on a dead network.
+  function reconnectNow() {
+    const old = ws;
+    ws = null;
+    try { old?.close(); } catch {}
+    retryDelay = 1000;
+    connect();
+  }
+
+  function checkConnection() {
+    if (stopped || !ws) return;
+    const now = performance.now();
+    if (ws.readyState === WebSocket.CONNECTING) {
+      if (now - connectStartedAt > CONNECT_TIMEOUT_MS) reconnectNow();
+    } else if (ws.readyState === WebSocket.OPEN) {
+      if (now - lastHeard > SILENCE_LIMIT_MS) reconnectNow();
+      else ws.send("ping"); // answered by the server with "pong"
+    }
+  }
+  setInterval(checkConnection, PING_INTERVAL_MS);
+
+  // Coming back to the tab or the network: check right away instead of at the next ping.
+  function probe() {
+    if (stopped || !ws) return;
+    if (ws.readyState !== WebSocket.OPEN) return reconnectNow();
+    const sentAt = performance.now();
+    ws.send("ping");
+    setTimeout(() => {
+      if (ws?.readyState === WebSocket.OPEN && lastHeard < sentAt) reconnectNow();
+    }, 3000);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") probe();
+  });
+  window.addEventListener("online", probe);
 
   function handleMessage(msg) {
     switch (msg.type) {
