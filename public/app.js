@@ -5,6 +5,8 @@ const HLS_MODULE = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.mjs";
 // UMD build (sets window.dashjs); pinned because dash.js 5 changed the track APIs used below.
 const DASH_SCRIPT = "https://cdn.jsdelivr.net/npm/dashjs@4.7.4/dist/dash.all.min.js";
 const SYNC_INTERVAL_MS = 4000;
+const SKIP_SECONDS = 10; // the ⟲/⟳ buttons and the ←/→ keys
+const KEY_REPEAT_MS = 400; // while an arrow key is held down, skip at most this often
 // Heartbeat: a connection can die without the browser noticing (Wi-Fi drop, sleep, a phone
 // locking), which left one person playing on alone. Ping often and reconnect if the room goes quiet.
 const PING_INTERVAL_MS = 5000;
@@ -262,15 +264,22 @@ function skip(seconds) {
   const end = Number.isFinite(video.duration) ? video.duration : Infinity;
   video.currentTime = Math.min(Math.max(video.currentTime + seconds, 0), end);
 }
-$("back-btn").addEventListener("click", () => skip(-10));
-$("forward-btn").addEventListener("click", () => skip(10));
-// Arrow keys too, which also work in fullscreen where the buttons aren't shown.
-document.addEventListener("keydown", (e) => {
-  if ($("player-wrap").hidden || e.target.closest?.("input, textarea, select")) return;
+$("back-btn").addEventListener("click", () => skip(-SKIP_SECONDS));
+$("forward-btn").addEventListener("click", () => skip(SKIP_SECONDS));
+// Arrow keys too, which also work in fullscreen where the buttons aren't shown. Listening in the
+// capture phase lets us stop the browser's own arrow handling on a focused <video>, which jumps
+// 1% of the duration (over a minute on a film) on top of ours.
+let lastKeySkip = 0;
+window.addEventListener("keydown", (e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  if ($("player-wrap").hidden || e.target.closest?.("input, textarea, select")) return;
   e.preventDefault();
-  skip(e.key === "ArrowLeft" ? -10 : 10);
-});
+  e.stopPropagation();
+  // Holding the key keeps skipping, but not at the keyboard's repeat rate.
+  if (e.repeat && performance.now() - lastKeySkip < KEY_REPEAT_MS) return;
+  lastKeySkip = performance.now();
+  skip(e.key === "ArrowLeft" ? -SKIP_SECONDS : SKIP_SECONDS);
+}, true);
 
 // Fade the overlay buttons out while playing, like the native controls.
 {
