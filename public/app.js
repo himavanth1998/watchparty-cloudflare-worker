@@ -328,9 +328,27 @@ function makeEl(tag, props = {}, children = []) {
 const makeButton = (text, className, onClick) =>
   makeEl("button", { type: "button", className, textContent: text, onclick: onClick });
 
+// A streaming link's id is the file's 13-character Real-Debrid id followed by a number
+// (streaming-BTDT3JDZN7PZM40, streaming-OO3WOMAGWOID2128). The id itself can end in digits, so
+// try the first 13 characters, then the other plausible cuts if Real-Debrid doesn't know it.
+function rdApiIdCandidates(linkId) {
+  return [...new Set([linkId.slice(0, 13), linkId.replace(/\d+$/, ""), linkId].filter(Boolean))];
+}
+
 async function fetchMediaInfos(linkId, key) {
-  // The API wants the link's id without its trailing digits (streaming-ABC40 -> ABC).
-  const apiId = linkId.replace(/\d+$/, "") || linkId;
+  let lastError;
+  for (const apiId of rdApiIdCandidates(linkId)) {
+    try {
+      return await fetchMediaInfosFor(apiId, key);
+    } catch (err) {
+      if (!err.unknownId) throw err;
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+async function fetchMediaInfosFor(apiId, key) {
   let res;
   try {
     // Real-Debrid's API doesn't allow browser (CORS) requests, so our Worker relays the call.
@@ -346,7 +364,11 @@ async function fetchMediaInfos(linkId, key) {
   }
   const body = await res.json().catch(() => null);
   if (res.status === 401 || res.status === 403) throw new Error("Real-Debrid rejected the API key");
-  if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(body?.error ?? `HTTP ${res.status}`);
+    err.unknownId = body?.error === "wrong_parameter" || body?.error === "unknown_ressource" || res.status === 404;
+    throw err;
+  }
   if (typeof body?.modelUrl !== "string") throw new Error("unexpected response from Real-Debrid");
   return body;
 }
