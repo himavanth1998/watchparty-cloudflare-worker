@@ -11,7 +11,8 @@ const MIN_SHARED_SEEK = 1.5; // seeks closer than this to the room's position ar
 const STALL_REPORT_MS = 700; // only stalls longer than this make both people wait
 const GAP_ESCAPE_MS = 2000; // stuck this long before a gap in the downloaded video: jump it
 const MAX_GAP_JUMP = 3; // ...if the gap is at most this many seconds
-const SKIP_SECONDS = 10; // the ⟲/⟳ buttons and the ←/→ keys
+const SKIP_SECONDS = 10;
+const RESTART_AHEAD_S = 60; // Real-Debrid: jumps further than this past what's loaded restart the stream there // the ⟲/⟳ buttons and the ←/→ keys
 const KEY_REPEAT_MS = 400; // while an arrow key is held down, skip at most this often
 // Heartbeat: a connection can die without the browser noticing (Wi-Fi drop, sleep, a phone
 // locking), which left one person playing on alone. Ping often and reconnect if the room goes quiet.
@@ -70,6 +71,8 @@ function showMessage(text, kind = "error") {
 async function loadSource(url) {
   const token = ++loadToken;
   currentUrl = url;
+  mediaOffset = 0;
+  restart = null;
   if (hls) {
     hls.destroy();
     hls = null;
@@ -172,6 +175,81 @@ function whenReady() {
   });
 }
 
+// ---------- movie time & far jumps ----------
+// Real-Debrid converts its streams on the fly, from the start. Jumping far ahead would wait for
+// it to get there, so instead we ask for the manifest again with ?t=<seconds>: the conversion
+// restarts at that point and the new stream begins at 0 again (same segment names). mediaOffset
+// is where the current stream starts in the movie, so outside the player everything uses
+// "movie time" = video.currentTime + mediaOffset.
+
+let mediaOffset = 0;
+let restart = null; // { target, resume } while reloading from a new starting point
+let roomDrivesPlayback = false; // in a room, the room's hold/resume decides when to play again
+
+const movieTime = () => (restart ? restart.target : (video.currentTime || 0) + mediaOffset);
+const movieDuration = () => (Number.isFinite(video.duration) ? mediaOffset + video.duration : 0);
+const isRestarting = () => restart !== null;
+
+function canRestart() {
+  if (!dash || !currentUrl) return false;
+  const { hostname, pathname } = new URL(currentUrl);
+  return /(^|\.)stream\.real-debrid\.com$/i.test(hostname) && pathname.endsWith(".mpd");
+}
+
+// End (in movie time) of the downloaded range around movie time t, or null if t isn't downloaded.
+function loadedUntil(t) {
+  const s = t - mediaOffset;
+  for (let i = 0; i < video.buffered.length; i++) {
+    if (s >= video.buffered.start(i) - 0.5 && s <= video.buffered.end(i) + 0.5) return video.buffered.end(i) + mediaOffset;
+  }
+  return null;
+}
+
+/**
+ * Seek to a movie time. For a restartable stream, a jump before the current stream's start, or
+ * well past what's downloaded, reloads the stream from there. `resume` says whether to play once
+ * it's ready (default: if it was playing; never in a room, where the room resumes everyone
+ * together). Resolves once the seek has started, or the reload has finished.
+ */
+function seekMovie(t, { resume } = {}) {
+  const duration = movieDuration();
+  t = Math.max(0, duration ? Math.min(t, duration - 0.5) : t);
+  if (canRestart()) {
+    const playhead = movieTime();
+    const ahead = Math.max(loadedUntil(playhead) ?? playhead, playhead) + RESTART_AHEAD_S;
+    if (restart || t < mediaOffset || (loadedUntil(t) === null && t > ahead)) return restartAt(t, resume);
+  }
+  video.currentTime = t - mediaOffset;
+  return Promise.resolve();
+}
+
+async function restartAt(t, resume) {
+  const start = Math.floor(t);
+  const token = ++loadToken;
+  resume ??= restart ? restart.resume : !video.paused;
+  restart = { target: t, resume };
+  video.dispatchEvent(new CustomEvent("wt-restart", { detail: { phase: "start", time: t } }));
+  mediaOffset = start;
+  const url = new URL(currentUrl);
+  url.searchParams.set("t", String(start));
+  const loaded = new Promise((resolve) => {
+    const done = () => {
+      video.removeEventListener("loadedmetadata", done);
+      video.removeEventListener("error", done);
+      resolve();
+    };
+    video.addEventListener("loadedmetadata", done);
+    video.addEventListener("error", done);
+  });
+  dash.attachSource(url.href);
+  await loaded;
+  if (token !== loadToken) return; // superseded by another jump or a new video
+  restart = null;
+  video.currentTime = t - start; // an ordinary seek, so it's reported like one
+  video.dispatchEvent(new CustomEvent("wt-restart", { detail: { phase: "end", time: t } }));
+  if (resume && !roomDrivesPlayback) video.play().catch(() => {});
+}
+
 video.addEventListener("error", () => {
   if (!currentUrl || hls || dash) return;
   showMessage(
@@ -240,7 +318,7 @@ function openTrackMenu(kind) {
 
   for (const o of audioOptions()) {
     add(o.label, o.active, () => {
-      programmaticSeek = video.currentTime; // some players re-seek to flush the old audio
+      programmaticSeek = movieTime(); // some players re-seek to flush the old audio
       o.select();
     });
   }
@@ -266,15 +344,12 @@ video.audioTracks?.addEventListener?.("addtrack", refreshTrackButtons);
 
 // Jump back/ahead. In a room this is an ordinary seek, so it's shared like any other.
 function skip(seconds) {
-  if (!currentUrl) return;
-  const end = Number.isFinite(video.duration) ? video.duration : Infinity;
-  video.currentTime = Math.min(Math.max(video.currentTime + seconds, 0), end);
+  if (currentUrl) seekMovie(movieTime() + seconds);
 }
 $("back-btn").addEventListener("click", () => skip(-SKIP_SECONDS));
 $("forward-btn").addEventListener("click", () => skip(SKIP_SECONDS));
-// Arrow keys too, which also work in fullscreen where the buttons aren't shown. Listening in the
-// capture phase lets us stop the browser's own arrow handling on a focused <video>, which jumps
-// 1% of the duration (over a minute on a film) on top of ours.
+// Arrow keys too. Listening in the capture phase keeps the browser's own arrow handling (which
+// jumps 1% of the duration) out of it.
 let lastKeySkip = 0;
 window.addEventListener("keydown", (e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -286,6 +361,82 @@ window.addEventListener("keydown", (e) => {
   lastKeySkip = performance.now();
   skip(e.key === "ArrowLeft" ? -SKIP_SECONDS : SKIP_SECONDS);
 }, true);
+
+// ---------- control bar ----------
+// Our own controls instead of the browser's: they show movie time, which matters once a
+// Real-Debrid stream has been restarted part-way (the <video> then starts at 0 mid-film).
+
+const seekBar = $("seek-bar");
+let scrubbing = false;
+
+function formatTime(seconds) {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const pad = (n) => String(n).padStart(2, "0");
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+}
+
+function renderControls() {
+  const duration = movieDuration();
+  const t = scrubbing ? Number(seekBar.value) : movieTime();
+  const pct = (x) => (duration ? `${Math.min(100, (x / duration) * 100)}%` : "0%");
+  seekBar.max = duration || 0;
+  if (!scrubbing) seekBar.value = t;
+  seekBar.style.setProperty("--played", pct(t));
+  seekBar.style.setProperty("--loaded", pct(loadedUntil(movieTime()) ?? t));
+  $("time-current").textContent = formatTime(t);
+  $("time-total").textContent = duration ? formatTime(duration) : "--:--";
+  $("player-wrap").classList.toggle("paused", video.paused);
+  $("mute-btn").classList.toggle("muted", video.muted || video.volume === 0);
+  $("volume-bar").value = video.muted ? 0 : video.volume;
+}
+for (const type of ["timeupdate", "durationchange", "progress", "play", "pause", "seeked", "loadedmetadata", "volumechange", "emptied", "wt-restart"]) {
+  video.addEventListener(type, renderControls);
+}
+
+const togglePlay = () => (video.paused ? video.play().catch(() => {}) : video.pause());
+$("play-btn").addEventListener("click", togglePlay);
+video.addEventListener("click", togglePlay);
+seekBar.addEventListener("input", () => {
+  scrubbing = true;
+  renderControls();
+});
+seekBar.addEventListener("change", () => {
+  scrubbing = false;
+  seekMovie(Number(seekBar.value));
+  renderControls();
+});
+$("mute-btn").addEventListener("click", () => {
+  if (video.muted || video.volume === 0) {
+    video.muted = false;
+    if (video.volume === 0) video.volume = 1;
+  } else {
+    video.muted = true;
+  }
+});
+$("volume-bar").addEventListener("input", (e) => {
+  video.volume = Number(e.target.value);
+  video.muted = video.volume === 0;
+});
+
+// Fullscreen the whole player so our buttons stay usable.
+function toggleFullscreen() {
+  const wrap = $("player-wrap");
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (wrap.requestFullscreen) wrap.requestFullscreen().catch(() => {});
+  else video.webkitEnterFullscreen?.(); // iPhone: only the bare video can go fullscreen
+}
+$("fullscreen-btn").addEventListener("click", toggleFullscreen);
+video.addEventListener("dblclick", toggleFullscreen);
+
+// Space toggles playback, like in most players.
+window.addEventListener("keydown", (e) => {
+  if (e.key !== " " || $("player-wrap").hidden || e.target.closest?.("input, textarea, select, button, a")) return;
+  e.preventDefault();
+  togglePlay();
+});
+renderControls();
 
 // Fade the overlay buttons out while playing, like the native controls.
 {
@@ -632,7 +783,6 @@ async function renderMyRooms() {
 function startHome() {
   $("home").hidden = false;
   renderMyRooms();
-  video.controls = true;
 
   const realDebrid = setupRealDebrid($("url-form"), $("url-input"));
 
@@ -700,7 +850,7 @@ function startRoom(roomId) {
 
   $("room").hidden = false;
   $("room-code").textContent = roomId;
-  video.controls = true; // both people can play, pause and seek
+  roomDrivesPlayback = true;
 
   function connect() {
     clearTimeout(reconnectTimer);
@@ -856,7 +1006,7 @@ function startRoom(roomId) {
       type: "update",
       reason,
       playing: !video.paused && !video.ended,
-      time: video.currentTime || 0,
+      time: movieTime(),
       base: version, // lets the room discard heartbeats that raced with a newer action
     };
     if (reason === "load") msg.url = currentUrl;
@@ -874,15 +1024,15 @@ function startRoom(roomId) {
   }
 
   // Tell the room when our player stalls or recovers so both sides can wait for each other.
-  function setBuffering(buffering) {
+  function setBuffering(buffering, time = movieTime()) {
     if (myBuffering === buffering || ws?.readyState !== WebSocket.OPEN) return;
     myBuffering = buffering;
     bufferingSince = performance.now();
-    ws.send(JSON.stringify({ type: "buffering", buffering, time: video.currentTime || 0 }));
+    ws.send(JSON.stringify({ type: "buffering", buffering, time }));
   }
 
   function checkReady() {
-    if (!myBuffering) return;
+    if (!myBuffering || isRestarting()) return;
     if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) return setBuffering(false);
     // Stuck right before a gap in what's been downloaded (streams converted on the fly can have
     // them after a jump). hls.js only jumps gaps while playing, and during a hold we're paused,
@@ -902,17 +1052,18 @@ function startRoom(roomId) {
   // Events caused by applyState() match what the room already knows, so only genuine
   // user actions (which differ from the room's state) get sent.
   video.addEventListener("play", () => {
-    if (appliedPlaying) return;
+    if (appliedPlaying || isRestarting()) return;
     appliedPlaying = true;
     sendUpdate("play");
   });
   video.addEventListener("pause", () => {
-    if (!appliedPlaying) return;
+    if (!appliedPlaying || isRestarting()) return;
     appliedPlaying = false;
     sendUpdate("pause");
   });
   video.addEventListener("seeked", () => {
-    const ours = programmaticSeek !== null && Math.abs(video.currentTime - programmaticSeek) < 0.5;
+    if (isRestarting()) return;
+    const ours = programmaticSeek !== null && Math.abs(movieTime() - programmaticSeek) < 0.5;
     programmaticSeek = null;
     if (ours) return;
     if (shareNextSeek) {
@@ -921,11 +1072,15 @@ function startRoom(roomId) {
     }
     // Not a person seeking: the player correcting itself by a fraction of a second. Sharing
     // those made both players keep re-seeking each other to the same spot.
-    if (Math.abs(video.currentTime - roomTime()) < MIN_SHARED_SEEK) return;
+    if (Math.abs(movieTime() - roomTime()) < MIN_SHARED_SEEK) return;
     sendUpdate("seek");
   });
+  // A far jump reloads the stream: the room waits for us like for any buffering.
+  video.addEventListener("wt-restart", (e) => {
+    if (e.detail.phase === "start") setBuffering(true, e.detail.time);
+  });
   video.addEventListener("waiting", () => {
-    if (video.paused || !appliedPlaying) return;
+    if (video.paused || !appliedPlaying || isRestarting()) return;
     clearTimeout(stallTimer);
     // Brief stalls sort themselves out; only make both people wait for a real one.
     stallTimer = setTimeout(() => {
@@ -938,7 +1093,7 @@ function startRoom(roomId) {
 
   setInterval(() => {
     // Drift correction: the host's position is the reference while playing normally.
-    if (role === "host" && !video.paused && appliedPlaying && !myBuffering) sendUpdate("sync");
+    if (role === "host" && !video.paused && appliedPlaying && !myBuffering && !isRestarting()) sendUpdate("sync");
   }, SYNC_INTERVAL_MS);
 
   const realDebrid = setupRealDebrid($("room-url-form"), $("room-url-input"));
@@ -1022,9 +1177,10 @@ function startRoom(roomId) {
     // Someone's deliberate action is matched closely; drift corrections and holds/resumes only
     // fix real differences, so they can't pull a player back to a spot it just got past.
     const tolerance = ["sync", "hold", "resume"].includes(s.reason) ? 1.0 : 0.5;
-    if (Math.abs(video.currentTime - target) > tolerance) {
+    if (Math.abs(movieTime() - target) > tolerance) {
       programmaticSeek = target;
-      video.currentTime = target;
+      await seekMovie(target, { resume: false }); // playing is decided below
+      if (latest !== s) return;
     }
 
     appliedPlaying = s.playing;
